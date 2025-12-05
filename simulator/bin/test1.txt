@@ -1,0 +1,4 @@
+DADDI R1, R0, 8         # address = 8
+DADDI R2, R0, 42        # value = 42
+SD    R2, 0(R1)         # mem[8] = 42   (store as double, but your mem is 64-bit)
+LW    R3, 0(R1)         # R3 = mem[8] (low 32 bits)
