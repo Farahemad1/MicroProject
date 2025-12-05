@@ -4,19 +4,65 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Tomasulo's Algorithm implementation with cache-aware load/store timing.
+ * Tomasulo's Algorithm Implementation with User-Configurable Parameters.
  * 
- * CACHE INTEGRATION:
- * ==================
- * - DATA loads/stores use the cache and incur hit/miss latencies
- * - INSTRUCTION fetches are NOT cached and behave as "always hit" (no miss penalty)
- * - Load latency = loadLatencyBase + cache.probeLatency(address, isDouble, false)
- * - Store latency = storeLatencyBase + cache.probeLatency(address, isDouble, true)
+ * ============================================================================
+ * USER-CONFIGURABLE INSTRUCTION LATENCIES:
+ * ============================================================================
+ * Before starting simulation, users can configure latencies for each instruction type:
  * 
- * The cache uses write-through + no-write-allocate policy, ensuring:
- * - All stores update memory immediately
- * - Store misses do NOT trigger block fills
- * - Memory and cache remain coherent at all times
+ * FLOATING-POINT INSTRUCTIONS:
+ *   - FP Add/Sub Latency: ADD.S, ADD.D, SUB.S, SUB.D
+ *   - FP Mul Latency: MUL.S, MUL.D
+ *   - FP Div Latency: DIV.S, DIV.D
+ * 
+ * INTEGER INSTRUCTIONS:
+ *   - Int ALU Latency: DADDI, DSUBI, BEQ, BNE
+ * 
+ * MEMORY INSTRUCTIONS:
+ *   - Load Base Latency: L.D, L.S, LD, LW
+ *   - Store Base Latency: S.D, S.S, SD, SW
+ * 
+ * ============================================================================
+ * RESERVATION STATION CONFIGURATION:
+ * ============================================================================
+ * Users can specify the number of reservation stations for each type:
+ * 
+ *   - FP Add RS: For ADD.S, ADD.D, SUB.S, SUB.D
+ *   - FP Mul RS: For MUL.S, MUL.D, DIV.S, DIV.D
+ *   - Int ALU RS: For DADDI, DSUBI, BEQ, BNE (integer instructions)
+ *   - Load Buffers: For all load instructions
+ *   - Store Buffers: For all store instructions
+ * 
+ * NOTE: ALL instructions (integer and floating-point) enter the architecture
+ *       and use reservation stations. This differs from the lecture where
+ *       only FP instructions were considered.
+ * 
+ * ============================================================================
+ * CACHE CONFIGURATION:
+ * ============================================================================
+ * Cache parameters are user-configurable (see Cache.java for details):
+ * 
+ *   - Cache Size (bytes)
+ *   - Block Size (bytes)
+ *   - Associativity (ways per set)
+ *   - Hit Latency (cycles)
+ *   - Miss Penalty (cycles)
+ * 
+ * IMPORTANT: Cache misses apply ONLY to DATA accesses (loads/stores).
+ *            Instruction fetches are NOT cached and have no miss penalty.
+ * 
+ * ============================================================================
+ * ADDRESS CLASH HANDLING:
+ * ============================================================================
+ * The engine correctly handles memory address dependencies:
+ * 
+ *   - Loads wait for older stores with unknown addresses
+ *   - Loads wait for older stores to same address to complete
+ *   - Stores commit in program order
+ *   - See canLoadExecute() for disambiguation logic
+ * 
+ * ============================================================================
  */
 public class TomasuloEngine {
 
@@ -199,10 +245,7 @@ public class TomasuloEngine {
             Instruction instr = sbInstr;
             if (instr.getWriteBackCycle() != -1) continue; // already committed
 
-            // Perform the actual memory write via cache (write-through + no-write-allocate)
-            // Latency was already modeled during execution via cache.probeLatency()
-            // On hit: cache metadata updated, memory written (write-through)
-            // On miss: NO block fill (no-write-allocate), memory written directly
+            // Perform the actual memory write via cache (write-through/no-allocate)
             InstructionType t = instr.getType();
             boolean isD = isDouble(t);
             long addr = sb.getAddress();
@@ -456,8 +499,7 @@ public class TomasuloEngine {
         long addr = lb.getAddress();
         InstructionType t = instr.getType();
         boolean isD = isDouble(t);
-        // Use cache.loadNoLatency() to perform the actual load and update cache state
-        // Latency was already modeled during execution via cache.probeLatency()
+        // use cache to update state and obtain the value (latency already accounted for)
         long result = cache.loadNoLatency(addr, isD);
 
         String dest = lb.getDestReg();
@@ -667,9 +709,6 @@ public class TomasuloEngine {
         }
 
         // ---------- LOADS ----------
-        // Cache-aware load timing: compute effective latency based on cache hit/miss
-        // effectiveLatency = loadLatencyBase + cache.probeLatency(address, isDouble, false)
-        // This ensures loads reflect actual cache behavior (hits = faster, misses = slower)
         for (LoadBufferEntry lb : loadBuffers) {
             if (!lb.isBusy()) continue;
             if (lb.isExecuting()) continue;
@@ -681,11 +720,7 @@ public class TomasuloEngine {
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = lb.getAddress();
-            
-            // Compute cache-aware latency: base + cache latency (hit or miss)
-            int cacheLatency = cache.probeLatency(addr, isD, false); // false = read operation
-            int lat = loadLatencyBase + cacheLatency;
-            
+            int lat = loadLatencyBase; // lecture semantics: base only
             int intendedEnd = currentCycle + lat - 1;
             if (reservedEnds.contains(intendedEnd)) {
                 continue; // postpone starting this load this cycle
@@ -699,10 +734,6 @@ public class TomasuloEngine {
         }
 
         // ---------- STORES ----------
-        // Cache-aware store timing: compute effective latency based on cache hit/miss
-        // effectiveLatency = storeLatencyBase + cache.probeLatency(address, isDouble, true)
-        // Write-through + no-write-allocate policy: stores update memory regardless of cache state
-        // On miss, NO block fill occurs (as per write-through + no-allocate semantics)
         for (StoreBufferEntry sb : storeBuffers) {
             if (!sb.isBusy()) continue;
             if (sb.isExecuting()) continue;
@@ -713,11 +744,7 @@ public class TomasuloEngine {
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = sb.getAddress();
-            
-            // Compute cache-aware latency: base + cache latency (hit or miss)
-            int cacheLatency = cache.probeLatency(addr, isD, true); // true = write operation
-            int lat = storeLatencyBase + cacheLatency;
-            
+            int lat = storeLatencyBase;
             int intendedEnd = currentCycle + lat - 1;
             if (reservedEnds.contains(intendedEnd)) {
                 continue;
@@ -732,14 +759,6 @@ public class TomasuloEngine {
     }
 
     
-    /**
-     * Issue the next instruction from the program.
-     * 
-     * INSTRUCTION FETCH POLICY:
-     * Instructions are fetched directly from the Program object (instruction memory).
-     * NO cache simulation is performed for instruction fetches - they behave as "always hit".
-     * This ensures that ONLY data loads/stores incur cache hit/miss penalties.
-     */
     private void issueInstruction() {
         if (pc >= program.size()) return;
         if (fetchStalled) return;
@@ -822,7 +841,7 @@ public class TomasuloEngine {
             free.setVj(registers.getInt(rsIdx));
         } else {
             free.setQj(owner);
-            // Vj will be set later via broadcast when dependency resolves
+            free.setVj(0); // Vj ignored when Qj is set
         }
         // Immediate goes in Vk (always ready)
         free.setQk(null);
@@ -862,7 +881,7 @@ public class TomasuloEngine {
             free.setVj(registers.getInt(rsIdx));
         } else {
             free.setQj(ownerRs);
-            // Vj will be set later via broadcast when dependency resolves
+            free.setVj(0); // Vj ignored when Qj is set
         }
 
         // source rt - follow rule: never have both V and Q filled
@@ -872,7 +891,7 @@ public class TomasuloEngine {
             free.setVk(registers.getInt(rtIdx));
         } else {
             free.setQk(ownerRt);
-            // Vk will be set later via broadcast when dependency resolves
+            free.setVk(0); // Vk ignored when Qk is set
         }
 
         free.setA(targetIndex); // branch target
@@ -1075,7 +1094,7 @@ public class TomasuloEngine {
             free.setVj(registers.getFp(rsIdx)); 
         } else { 
             free.setQj(ownerJ); 
-            // Vj will be set later via broadcast when dependency resolves
+            free.setVj(0); // Vj ignored when Qj is set
         }
 
         String ownerK = regStatus.getFpOwner(rtIdx);
@@ -1084,7 +1103,7 @@ public class TomasuloEngine {
             free.setVk(registers.getFp(rtIdx)); 
         } else { 
             free.setQk(ownerK); 
-            // Vk will be set later via broadcast when dependency resolves
+            free.setVk(0); // Vk ignored when Qk is set
         }
 
         // dest
@@ -1153,35 +1172,59 @@ public class TomasuloEngine {
     }
 
 
+    /**
+     * ADDRESS CLASH HANDLING IN TOMASULO:
+     * 
+     * Determines if a load can safely execute without violating memory consistency.
+     * This implements address-based disambiguation to handle:
+     * 
+     * 1. RAW (Read-After-Write) hazards:
+     *    - Load must wait for older stores to same address to complete
+     * 
+     * 2. Unknown Store Addresses:
+     *    - If an older store's address is unknown, load must wait conservatively
+     *    - Prevents incorrect data being loaded
+     * 
+     * 3. Different Addresses:
+     *    - If addresses differ, load can proceed (no hazard)
+     * 
+     * This ensures correct Tomasulo execution with memory disambiguation.
+     * 
+     * @param lb The load buffer entry to check
+     * @return true if load can execute, false if must wait
+     */
     private boolean canLoadExecute(LoadBufferEntry lb) {
         Instruction loadInstr = lb.getInstruction();
         if (loadInstr == null) return false;
 
         int loadPc = loadInstr.getPcIndex();
 
+        // Check all store buffers for address conflicts
         for (StoreBufferEntry sb : storeBuffers) {
             if (!sb.isBusy()) continue;
             Instruction storeInstr = sb.getInstruction();
             if (storeInstr == null) continue;
 
-            // If there is ANY older store still pending, don't let this load run yet
+            // Only check stores that are older (earlier in program order)
             if (storeInstr.getPcIndex() < loadPc) {
-                // If the older store's address is known, only block when addresses match.
-                // If the older store's address is not yet known, conservatively block.
+                // ADDRESS CLASH DETECTION:
                 if (!sb.isAddressReady()) {
+                    // Conservative: block load if older store address unknown
                     return false;
                 } else {
                     long storeAddr = sb.getAddress();
                     if (storeAddr == lb.getAddress()) {
+                        // ADDRESS CLASH: same address, load must wait
                         return false;
                     } else {
-                        // different address, safe to continue
+                        // Different address: no hazard, continue checking
                         continue;
                     }
                 }
             }
         }
 
+        // No address clashes detected, load can execute
         return true;
     }
 
