@@ -25,6 +25,7 @@ public class StateViewModel {
 
 	public int fpAddLatency = 2;
 	public int fpMulLatency = 4;
+	public int fpDivLatency = 40;
 	public int intAluLatency = 1;
 	public int loadLatencyBase = 2;
 	public int storeLatencyBase = 2;
@@ -64,6 +65,7 @@ public class StateViewModel {
 				numStoreBuffers,
 				fpAddLatency,
 				fpMulLatency,
+				fpDivLatency,
 				intAluLatency,
 				loadLatencyBase,
 				storeLatencyBase

@@ -28,11 +28,12 @@ public class TomasuloEngine {
     // Config (latencies, sizes, etc.)
     private final int fpAddLatency;
     private final int fpMulLatency;
+    private final int fpDivLatency;
     private final int intAluLatency;
     private final int loadLatencyBase;  // we�ll combine with cache latency
     private final int storeLatencyBase;
 
-    public TomasuloEngine(
+        public TomasuloEngine(
             Program program,
             RegisterFile registers,
             RegisterStatus regStatus,
@@ -45,6 +46,7 @@ public class TomasuloEngine {
             int numStoreBuffers,
             int fpAddLatency,
             int fpMulLatency,
+            int fpDivLatency,
             int intAluLatency,
             int loadLatencyBase,
             int storeLatencyBase
@@ -57,6 +59,7 @@ public class TomasuloEngine {
 
         this.fpAddLatency = fpAddLatency;
         this.fpMulLatency = fpMulLatency;
+        this.fpDivLatency = fpDivLatency;
         this.intAluLatency = intAluLatency;
         this.loadLatencyBase = loadLatencyBase;
         this.storeLatencyBase = storeLatencyBase;
@@ -129,18 +132,25 @@ public class TomasuloEngine {
         // Advance global cycle counter
         currentCycle++;
 
-        // 1) Decrement remainingCycles for all executing RS / loads / stores
-        advanceExecuting();
-
-        // 2) Commit any finished stores (stores don't use CDB)
-        completeFinishedStores();
-
-        // 3) Do one CDB broadcast this cycle (either an INT ALU result or a LOAD result)
-        handleWriteBack();
-
-        // 4) Start execution for any RS / loads / stores that are now ready
+        // Stage 2: Execute (before Write Result)
+        // 1) Start execution for any RS / loads / stores that are now ready
+        //    (values from PREVIOUS cycle's CDB broadcast)
         startReadyExecutions();
 
+        // 2) Decrement remainingCycles for all executing RS / loads / stores
+        //    and mark execute-complete when remaining reaches 0 (this cycle)
+        advanceExecuting();
+
+        // Stage 3: Write Result (after Execute starts)
+        // 3) Commit any finished stores (stores don't use CDB but must write to memory
+        //    before next cycle's operations)
+        completeFinishedStores();
+
+        // 4) Do one CDB broadcast this cycle (either an INT ALU result or a LOAD result)
+        //    Values broadcast here will be available for execution start NEXT cycle
+        handleWriteBack();
+
+        // Stage 1: Issue
         // 5) Issue at most one new instruction (respecting branch stall)
         issueInstruction();
 
@@ -164,10 +174,13 @@ public class TomasuloEngine {
     private void completeFinishedStores() {
         for (StoreBufferEntry sb : storeBuffers) {
             if (!sb.isBusy()) continue;
-            if (sb.getRemainingCycles() > 0) continue;
+            // Only commit stores that actually finished execution this cycle
+            Instruction sbInstr = sb.getInstruction();
+            if (sbInstr == null) continue;
+            // commit only stores that finished execution in a previous cycle
+            if (sbInstr.getEndExecCycle() == -1 || sbInstr.getEndExecCycle() >= currentCycle) continue;
 
-            Instruction instr = sb.getInstruction();
-            if (instr == null) continue;
+            Instruction instr = sbInstr;
             if (instr.getWriteBackCycle() != -1) continue; // already committed
 
             // Perform the actual memory write via cache (write-through/no-allocate)
@@ -192,31 +205,35 @@ public class TomasuloEngine {
         List<ReservationStation> rsCandidates = new ArrayList<>();
         // FP add
         for (ReservationStation rs : fpAddStations) {
-            if (rs.isBusy()
+                if (rs.isBusy()
                     && rs.getOp() != null
-                    && rs.getRemainingCycles() == 0
                     && rs.getInstruction() != null
-                    && rs.getInstruction().getWriteBackCycle() == -1) {
+                    && rs.getInstruction().getWriteBackCycle() == -1
+                    // only consider producers that completed execution in a previous cycle
+                    && rs.getInstruction().getEndExecCycle() != -1
+                    && rs.getInstruction().getEndExecCycle() < currentCycle) {
                 rsCandidates.add(rs);
             }
         }
         // FP mul
         for (ReservationStation rs : fpMulStations) {
-            if (rs.isBusy()
+                if (rs.isBusy()
                     && rs.getOp() != null
-                    && rs.getRemainingCycles() == 0
                     && rs.getInstruction() != null
-                    && rs.getInstruction().getWriteBackCycle() == -1) {
+                    && rs.getInstruction().getWriteBackCycle() == -1
+                    && rs.getInstruction().getEndExecCycle() != -1
+                    && rs.getInstruction().getEndExecCycle() < currentCycle) {
                 rsCandidates.add(rs);
             }
         }
         // INT ALU
         for (ReservationStation rs : intAluStations) {
-            if (rs.isBusy()
+                if (rs.isBusy()
                     && rs.getOp() != null
-                    && rs.getRemainingCycles() == 0
                     && rs.getInstruction() != null
-                    && rs.getInstruction().getWriteBackCycle() == -1) {
+                    && rs.getInstruction().getWriteBackCycle() == -1
+                    && rs.getInstruction().getEndExecCycle() != -1
+                    && rs.getInstruction().getEndExecCycle() < currentCycle) {
                 rsCandidates.add(rs);
             }
         }
@@ -225,9 +242,11 @@ public class TomasuloEngine {
         List<LoadBufferEntry> loadCandidates = new ArrayList<>();
         for (LoadBufferEntry lb : loadBuffers) {
             if (lb.isBusy()
-                    && lb.getRemainingCycles() == 0
                     && lb.getInstruction() != null
-                    && lb.getInstruction().getWriteBackCycle() == -1) {
+                    && lb.getInstruction().getWriteBackCycle() == -1
+                    // only loads that finished execution in an earlier cycle
+                    && lb.getInstruction().getEndExecCycle() != -1
+                    && lb.getInstruction().getEndExecCycle() < currentCycle) {
                 loadCandidates.add(lb);
             }
         }
@@ -543,14 +562,54 @@ public class TomasuloEngine {
     }
     
     private void startReadyExecutions() {
+        // Build a set of end cycles already reserved by currently executing units.
+        // For an executing unit with remainingCycles R, its predicted end cycle
+        // (before this cycle's decrement) is currentCycle + R - 1.
+        java.util.Set<Integer> reservedEnds = new java.util.HashSet<>();
+        for (ReservationStation rs : fpAddStations) {
+            if (rs.isExecuting()) {
+                int predictedEnd = currentCycle + rs.getRemainingCycles() - 1;
+                reservedEnds.add(predictedEnd);
+            }
+        }
+        for (ReservationStation rs : fpMulStations) {
+            if (rs.isExecuting()) {
+                int predictedEnd = currentCycle + rs.getRemainingCycles() - 1;
+                reservedEnds.add(predictedEnd);
+            }
+        }
+        for (ReservationStation rs : intAluStations) {
+            if (rs.isExecuting()) {
+                int predictedEnd = currentCycle + rs.getRemainingCycles() - 1;
+                reservedEnds.add(predictedEnd);
+            }
+        }
+        for (LoadBufferEntry lb : loadBuffers) {
+            if (lb.isExecuting()) {
+                int predictedEnd = currentCycle + lb.getRemainingCycles() - 1;
+                reservedEnds.add(predictedEnd);
+            }
+        }
+        for (StoreBufferEntry sb : storeBuffers) {
+            if (sb.isExecuting()) {
+                int predictedEnd = currentCycle + sb.getRemainingCycles() - 1;
+                reservedEnds.add(predictedEnd);
+            }
+        }
+
         // ---------- FP ADD/SUB ----------
         for (ReservationStation rs : fpAddStations) {
-            if (rs.isBusy()
-                    && !rs.isExecuting()
-                    && rs.isReady()) {
-
-                rs.setExecutionLatency(fpAddLatency);
-                rs.setRemainingCycles(fpAddLatency);
+            if (rs.isBusy() && !rs.isExecuting() && rs.isReady()) {
+                int lat = fpAddLatency;
+                int intendedEnd = currentCycle + lat - 1;
+                if (reservedEnds.contains(intendedEnd)) {
+                    // Skip starting this RS now to avoid end-cycle collision
+                    continue;
+                }
+                // Reserve the end cycle and start execution
+                reservedEnds.add(intendedEnd);
+                rs.setExecutionLatency(lat);
+                rs.setRemainingCycles(lat);
 
                 Instruction instr = rs.getInstruction();
                 if (instr != null && instr.getStartExecCycle() == -1) {
@@ -561,12 +620,17 @@ public class TomasuloEngine {
 
         // ---------- FP MUL/DIV ----------
         for (ReservationStation rs : fpMulStations) {
-            if (rs.isBusy()
-                    && !rs.isExecuting()
-                    && rs.isReady()) {
-
-                rs.setExecutionLatency(fpMulLatency);
-                rs.setRemainingCycles(fpMulLatency);
+            if (rs.isBusy() && !rs.isExecuting() && rs.isReady()) {
+                InstructionType op = rs.getOp();
+                int lat = fpMulLatency;
+                if (op == InstructionType.DIV_S || op == InstructionType.DIV_D) lat = fpDivLatency;
+                int intendedEnd = currentCycle + lat - 1;
+                if (reservedEnds.contains(intendedEnd)) {
+                    continue;
+                }
+                reservedEnds.add(intendedEnd);
+                rs.setExecutionLatency(lat);
+                rs.setRemainingCycles(lat);
 
                 Instruction instr = rs.getInstruction();
                 if (instr != null && instr.getStartExecCycle() == -1) {
@@ -577,12 +641,15 @@ public class TomasuloEngine {
 
         // ---------- INT ALU: DADDI, DSUBI, BEQ, BNE ----------
         for (ReservationStation rs : intAluStations) {
-            if (rs.isBusy()
-                    && !rs.isExecuting()
-                    && rs.isReady()) {
-
-                rs.setExecutionLatency(intAluLatency);
-                rs.setRemainingCycles(intAluLatency);
+            if (rs.isBusy() && !rs.isExecuting() && rs.isReady()) {
+                int lat = intAluLatency;
+                int intendedEnd = currentCycle + lat - 1;
+                if (reservedEnds.contains(intendedEnd)) {
+                    continue;
+                }
+                reservedEnds.add(intendedEnd);
+                rs.setExecutionLatency(lat);
+                rs.setRemainingCycles(lat);
 
                 Instruction instr = rs.getInstruction();
                 if (instr != null && instr.getStartExecCycle() == -1) {
@@ -598,32 +665,24 @@ public class TomasuloEngine {
             if (!lb.isAddressReady()) continue;
             if (!canLoadExecute(lb)) continue; // respect older stores to same address
 
-         // DEBUG:
-            System.out.println("startReadyExecutions: starting LOAD exec on "
-                    + lb.getName()
-                    + " at cycle " + currentCycle
-                    + " addr=" + lb.getAddress());
-            // Determine cache latency and include it in remaining cycles
+            // Determine intended end and avoid collisions
             Instruction instr = lb.getInstruction();
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = lb.getAddress();
-            int cacheLat = cache.probeLatency(addr, isD, false);
-            lb.setRemainingCycles(loadLatencyBase + cacheLat);
+            int lat = loadLatencyBase; // lecture semantics: base only
+            int intendedEnd = currentCycle + lat - 1;
+            if (reservedEnds.contains(intendedEnd)) {
+                continue; // postpone starting this load this cycle
+            }
+            System.out.println("startReadyExecutions: starting LOAD exec on "
+                    + lb.getName() + " at cycle " + currentCycle + " addr=" + lb.getAddress());
+            reservedEnds.add(intendedEnd);
+            lb.setRemainingCycles(lat);
 
-            Instruction instr = lb.getInstruction();
             if (instr != null && instr.getStartExecCycle() == -1) {
                 instr.setStartExecCycle(currentCycle);
             }
-
-            // We can compute the value now from memory
-//            InstructionType t = instr.getType();
-//            boolean isD = isDouble(t);
-//            long addr = lb.getAddress();
-//            long val = isD ? memory.loadDouble(addr) : memory.loadWord(addr);
-//            lb.setValue(val);
-//            // DEBUG:
-//            System.out.println("  load will read value=" + val + " into dest=" + lb.getDestReg());
         }
 
         // ---------- STORES ----------
@@ -633,15 +692,18 @@ public class TomasuloEngine {
             if (!sb.isAddressReady()) continue;
             if (!sb.isValueReady()) continue;
 
-            // include cache probe latency for stores
             Instruction instr = sb.getInstruction();
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = sb.getAddress();
-            int cacheLat = cache.probeLatency(addr, isD, true);
-            sb.setRemainingCycles(storeLatencyBase + cacheLat);
+            int lat = storeLatencyBase;
+            int intendedEnd = currentCycle + lat - 1;
+            if (reservedEnds.contains(intendedEnd)) {
+                continue;
+            }
+            reservedEnds.add(intendedEnd);
+            sb.setRemainingCycles(lat);
 
-            Instruction instr = sb.getInstruction();
             if (instr != null && instr.getStartExecCycle() == -1) {
                 instr.setStartExecCycle(currentCycle);
             }
@@ -802,6 +864,7 @@ public class TomasuloEngine {
                 int before = rs.getRemainingCycles();
                 rs.setRemainingCycles(before - 1);
                 if (before == 1 && rs.getInstruction() != null) {
+                    // Execution completes in this cycle when remaining cycles reached 0
                     rs.getInstruction().setEndExecCycle(currentCycle);
                 }
             }
@@ -811,6 +874,7 @@ public class TomasuloEngine {
                 int before = rs.getRemainingCycles();
                 rs.setRemainingCycles(before - 1);
                 if (before == 1 && rs.getInstruction() != null) {
+                    // Execution completes in this cycle when remaining cycles reached 0
                     rs.getInstruction().setEndExecCycle(currentCycle);
                 }
             }
@@ -820,6 +884,7 @@ public class TomasuloEngine {
                 int before = rs.getRemainingCycles();
                 rs.setRemainingCycles(before - 1);
                 if (before == 1 && rs.getInstruction() != null) {
+                    // Execution completes in this cycle when remaining cycles reached 0
                     rs.getInstruction().setEndExecCycle(currentCycle);
                 }
             }
@@ -836,6 +901,7 @@ public class TomasuloEngine {
                         + " cycle=" + currentCycle);
 
                 if (before == 1 && lb.getInstruction() != null) {
+                    // For loads, execution completes in this cycle
                     lb.getInstruction().setEndExecCycle(currentCycle);
                 }
             }
@@ -847,6 +913,7 @@ public class TomasuloEngine {
                 int before = sb.getRemainingCycles();
                 sb.setRemainingCycles(before - 1);
                 if (before == 1 && sb.getInstruction() != null) {
+                    // For stores, execution completes in this cycle
                     sb.getInstruction().setEndExecCycle(currentCycle);
                 }
             }

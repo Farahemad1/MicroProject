@@ -34,7 +34,7 @@ public class SwingMain {
 
     // Parameter controls
     private JSpinner spFpAddRS, spFpMulRS, spIntAluRS, spLoadBuf, spStoreBuf;
-    private JSpinner spFpAddLat, spFpMulLat, spIntAluLat, spLoadLat, spStoreLat;
+    private JSpinner spFpAddLat, spFpMulLat, spFpDivLat, spIntAluLat, spLoadLat, spStoreLat;
     // Cache controls
     private JSpinner spCacheSize, spBlockSize, spAssoc, spCacheHitLat, spCacheMissPen;
     private JTable cacheTable;
@@ -145,12 +145,14 @@ public class SwingMain {
 
         spFpAddLat = new JSpinner(new SpinnerNumberModel(viewModel.fpAddLatency, 1, 100, 1));
         spFpMulLat = new JSpinner(new SpinnerNumberModel(viewModel.fpMulLatency, 1, 100, 1));
+        spFpDivLat = new JSpinner(new SpinnerNumberModel(viewModel.fpDivLatency, 1, 500, 1));
         spIntAluLat = new JSpinner(new SpinnerNumberModel(viewModel.intAluLatency, 1, 100, 1));
         spLoadLat = new JSpinner(new SpinnerNumberModel(viewModel.loadLatencyBase, 1, 100, 1));
         spStoreLat = new JSpinner(new SpinnerNumberModel(viewModel.storeLatencyBase, 1, 100, 1));
 
         lats.add(createParamLabel("FP Add Lat:")); lats.add(spFpAddLat);
         lats.add(createParamLabel("FP Mul Lat:")); lats.add(spFpMulLat);
+        lats.add(createParamLabel("FP Div Lat:")); lats.add(spFpDivLat);
         lats.add(createParamLabel("Int ALU Lat:")); lats.add(spIntAluLat);
         lats.add(createParamLabel("Load Lat:")); lats.add(spLoadLat);
         lats.add(createParamLabel("Store Lat:")); lats.add(spStoreLat);
@@ -524,6 +526,7 @@ public class SwingMain {
 
         viewModel.fpAddLatency = (Integer) spFpAddLat.getValue();
         viewModel.fpMulLatency = (Integer) spFpMulLat.getValue();
+        viewModel.fpDivLatency = (Integer) spFpDivLat.getValue();
         viewModel.intAluLatency = (Integer) spIntAluLat.getValue();
         viewModel.loadLatencyBase = (Integer) spLoadLat.getValue();
         viewModel.storeLatencyBase = (Integer) spStoreLat.getValue();

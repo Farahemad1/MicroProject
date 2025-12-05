@@ -58,10 +58,10 @@ public class Cache {
         for (int w = 0; w < associativity; w++) {
             CacheLine line = ways[w];
             if (line.valid && line.tag == tag) {
-                // hit
+                // hit (metadata-only cache): update LRU and read from memory (write-through ensures memory is up-to-date)
                 line.lruCounter = (int) accessCounter;
                 hits++;
-                long value = readValueFromLine(line, address, isDouble);
+                long value = isDouble ? memory.loadDouble(address) : memory.loadWord(address);
                 return new CacheAccessResult(value, hitLatency);
             }
         }
@@ -80,18 +80,12 @@ public class Cache {
 
         CacheLine chosen = ways[victim];
 
-        // load block bytes from memory
-        byte[] mem = memory.getRawDataCopy();
-        int blockStart = (int) (blockNumber * blockSize);
-        int toCopy = Math.min(blockSize, mem.length - blockStart);
-        // ensure blockData size
-        if (chosen.blockData.length != blockSize) chosen.blockData = new byte[blockSize];
-        System.arraycopy(mem, blockStart, chosen.blockData, 0, toCopy);
+        // metadata-only miss: install tag and update LRU; read value from memory
         chosen.valid = true;
         chosen.tag = tag;
         chosen.lruCounter = (int) accessCounter;
 
-        long value = readValueFromLine(chosen, address, isDouble);
+        long value = isDouble ? memory.loadDouble(address) : memory.loadWord(address);
         int latency = hitLatency + missPenalty;
         return new CacheAccessResult(value, latency);
     }
@@ -131,10 +125,10 @@ public class Cache {
         for (int w = 0; w < associativity; w++) {
             CacheLine line = ways[w];
             if (line.valid && line.tag == tag) {
-                // hit
+                // hit: update LRU and read from memory (data kept coherent via write-through)
                 line.lruCounter = (int) accessCounter;
                 hits++;
-                return readValueFromLine(line, address, isDouble);
+                return isDouble ? memory.loadDouble(address) : memory.loadWord(address);
             }
         }
 
@@ -148,16 +142,11 @@ public class Cache {
             if (line.lruCounter < oldest) { oldest = line.lruCounter; victim = w; }
         }
         CacheLine chosen = ways[victim];
-        byte[] mem = memory.getRawDataCopy();
-        int blockStart = (int) (blockNumber * blockSize);
-        int toCopy = Math.min(blockSize, mem.length - blockStart);
-        if (chosen.blockData.length != blockSize) chosen.blockData = new byte[blockSize];
-        System.arraycopy(mem, blockStart, chosen.blockData, 0, toCopy);
+        // miss: install metadata and read from memory
         chosen.valid = true;
         chosen.tag = tag;
         chosen.lruCounter = (int) accessCounter;
-
-        return readValueFromLine(chosen, address, isDouble);
+        return isDouble ? memory.loadDouble(address) : memory.loadWord(address);
     }
 
     /**
@@ -175,11 +164,10 @@ public class Cache {
         for (int w = 0; w < associativity; w++) {
             CacheLine line = ways[w];
             if (line.valid && line.tag == tag) {
-                // hit: update cache block and write through to memory
-                writeValueToLine(line, address, value, isDouble);
+                // hit: update metadata LRU and write through to memory
+                line.lruCounter = (int) accessCounter;
                 if (isDouble) memory.storeDouble(address, value);
                 else memory.storeWord(address, value);
-                line.lruCounter = (int) accessCounter;
                 hits++;
                 return;
             }
@@ -204,11 +192,10 @@ public class Cache {
         for (int w = 0; w < associativity; w++) {
             CacheLine line = ways[w];
             if (line.valid && line.tag == tag) {
-                // hit: update cache block and write through to memory
-                writeValueToLine(line, address, value, isDouble);
+                // hit: update metadata LRU and write through to memory
+                line.lruCounter = (int) accessCounter;
                 if (isDouble) memory.storeDouble(address, value);
                 else memory.storeWord(address, value);
-                line.lruCounter = (int) accessCounter;
                 hits++;
                 return new CacheAccessResult(0L, hitLatency);
             }
@@ -222,49 +209,7 @@ public class Cache {
         return new CacheAccessResult(0L, latency);
     }
 
-    private long readValueFromLine(CacheLine line, long address, boolean isDouble) {
-        int offset = (int) (address % blockSize);
-        if (isDouble) {
-            // read 8 bytes big-endian
-            long b0 = (line.blockData[offset]     & 0xFFL);
-            long b1 = (line.blockData[offset + 1] & 0xFFL);
-            long b2 = (line.blockData[offset + 2] & 0xFFL);
-            long b3 = (line.blockData[offset + 3] & 0xFFL);
-            long b4 = (line.blockData[offset + 4] & 0xFFL);
-            long b5 = (line.blockData[offset + 5] & 0xFFL);
-            long b6 = (line.blockData[offset + 6] & 0xFFL);
-            long b7 = (line.blockData[offset + 7] & 0xFFL);
-            return (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32)
-                 | (b4 << 24) | (b5 << 16) | (b6 << 8)  | b7;
-        } else {
-            int b0 = (line.blockData[offset]     & 0xFF);
-            int b1 = (line.blockData[offset + 1] & 0xFF);
-            int b2 = (line.blockData[offset + 2] & 0xFF);
-            int b3 = (line.blockData[offset + 3] & 0xFF);
-            int v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
-            return (long) v;
-        }
-    }
-
-    private void writeValueToLine(CacheLine line, long address, long value, boolean isDouble) {
-        int offset = (int) (address % blockSize);
-        if (isDouble) {
-            line.blockData[offset]     = (byte) ((value >>> 56) & 0xFF);
-            line.blockData[offset + 1] = (byte) ((value >>> 48) & 0xFF);
-            line.blockData[offset + 2] = (byte) ((value >>> 40) & 0xFF);
-            line.blockData[offset + 3] = (byte) ((value >>> 32) & 0xFF);
-            line.blockData[offset + 4] = (byte) ((value >>> 24) & 0xFF);
-            line.blockData[offset + 5] = (byte) ((value >>> 16) & 0xFF);
-            line.blockData[offset + 6] = (byte) ((value >>> 8)  & 0xFF);
-            line.blockData[offset + 7] = (byte) (value & 0xFF);
-        } else {
-            int v = (int) value;
-            line.blockData[offset]     = (byte) ((v >>> 24) & 0xFF);
-            line.blockData[offset + 1] = (byte) ((v >>> 16) & 0xFF);
-            line.blockData[offset + 2] = (byte) ((v >>> 8)  & 0xFF);
-            line.blockData[offset + 3] = (byte) (v & 0xFF);
-        }
-    }
+    // Note: byte-level block storage removed in metadata-only cache
 
     public long getHits() { return hits; }
     public long getMisses() { return misses; }

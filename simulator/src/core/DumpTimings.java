@@ -16,7 +16,7 @@ public class DumpTimings {
         TomasuloEngine engine = new TomasuloEngine(
                 prog, rf, rs, mem, cache,
                 3, 2, 3, 3, 3,
-                2, 4, 1, 2, 2
+            2, 4, 40, 1, 2, 2
         );
 
         // run until a max cycle or until no more progress

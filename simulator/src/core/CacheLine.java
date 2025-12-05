@@ -3,14 +3,13 @@ package core;
 public class CacheLine {
     boolean valid;
     long tag;
-    byte[] blockData;
     int lruCounter;
 
     public CacheLine(int blockSize){
-    	this.valid=false;
-    	this.tag=0;
-    	this.blockData=new byte[blockSize];
-    	this.lruCounter=0;
+        // blockSize parameter kept for compatibility but not used in metadata-only model
+        this.valid = false;
+        this.tag = 0;
+        this.lruCounter = 0;
     }
 
     public boolean isValid() { return valid; }

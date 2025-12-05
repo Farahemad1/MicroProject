@@ -16,11 +16,12 @@ public class TestEngine {
         TomasuloEngine engine = new TomasuloEngine(
                 prog, rf, rs, mem, cache,
                 3, 2, 3, 3, 3,
-                2,  // fpAddLatency (unused)
-                4,  // fpMulLatency (unused)
-                1,  // intAluLatency
-                2,  // loadLatencyBase
-                2   // storeLatencyBase
+            2,  // fpAddLatency (unused)
+            4,  // fpMulLatency (unused)
+            40, // fpDivLatency
+            1,  // intAluLatency
+            2,  // loadLatencyBase
+            2   // storeLatencyBase
         );
 
         for (int i = 0; i < 20; i++) {
