@@ -3,6 +3,21 @@ package core;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Tomasulo's Algorithm implementation with cache-aware load/store timing.
+ * 
+ * CACHE INTEGRATION:
+ * ==================
+ * - DATA loads/stores use the cache and incur hit/miss latencies
+ * - INSTRUCTION fetches are NOT cached and behave as "always hit" (no miss penalty)
+ * - Load latency = loadLatencyBase + cache.probeLatency(address, isDouble, false)
+ * - Store latency = storeLatencyBase + cache.probeLatency(address, isDouble, true)
+ * 
+ * The cache uses write-through + no-write-allocate policy, ensuring:
+ * - All stores update memory immediately
+ * - Store misses do NOT trigger block fills
+ * - Memory and cache remain coherent at all times
+ */
 public class TomasuloEngine {
 
     private final Program program;
@@ -132,25 +147,26 @@ public class TomasuloEngine {
         // Advance global cycle counter
         currentCycle++;
 
-        // Stage 2: Execute (before Write Result)
-        // 1) Start execution for any RS / loads / stores that are now ready
-        //    (values from PREVIOUS cycle's CDB broadcast)
-        startReadyExecutions();
-
-        // 2) Decrement remainingCycles for all executing RS / loads / stores
-        //    and mark execute-complete when remaining reaches 0 (this cycle)
-        advanceExecuting();
-
-        // Stage 3: Write Result (after Execute starts)
-        // 3) Commit any finished stores (stores don't use CDB but must write to memory
+        // Stage 1: Write Result (CDB broadcast from previous cycle's completed executions)
+        // 1) Commit any finished stores (stores don't use CDB but must write to memory
         //    before next cycle's operations)
         completeFinishedStores();
 
-        // 4) Do one CDB broadcast this cycle (either an INT ALU result or a LOAD result)
-        //    Values broadcast here will be available for execution start NEXT cycle
+        // 2) Do one CDB broadcast this cycle (for instructions that completed execution in previous cycles)
+        //    Values broadcast here will be available for execution start THIS cycle (after broadcast)
+        //    This also FREES the RS/LB that broadcasts
         handleWriteBack();
 
-        // Stage 1: Issue
+        // Stage 2: Execute
+        // 3) Start execution for any RS / loads / stores that are now ready
+        //    (values from THIS cycle's CDB broadcast, or from registers)
+        startReadyExecutions();
+
+        // 4) Decrement remainingCycles for all executing RS / loads / stores
+        //    and mark execute-complete when remaining reaches 0 (this cycle)
+        advanceExecuting();
+
+        // Stage 3: Issue
         // 5) Issue at most one new instruction (respecting branch stall)
         issueInstruction();
 
@@ -183,7 +199,10 @@ public class TomasuloEngine {
             Instruction instr = sbInstr;
             if (instr.getWriteBackCycle() != -1) continue; // already committed
 
-            // Perform the actual memory write via cache (write-through/no-allocate)
+            // Perform the actual memory write via cache (write-through + no-write-allocate)
+            // Latency was already modeled during execution via cache.probeLatency()
+            // On hit: cache metadata updated, memory written (write-through)
+            // On miss: NO block fill (no-write-allocate), memory written directly
             InstructionType t = instr.getType();
             boolean isD = isDouble(t);
             long addr = sb.getAddress();
@@ -255,9 +274,6 @@ public class TomasuloEngine {
         if (rsCandidates.isEmpty() && loadCandidates.isEmpty()) {
             return;
         }
-        System.out.println("handleWriteBack: cycle " + currentCycle
-                + " rsCandidates=" + rsCandidates.size()
-                + " loadCandidates=" + loadCandidates.size());
 
         // ---- 3) Choose the best producer for the single CDB this cycle ----
         String bestName = null;
@@ -307,12 +323,7 @@ public class TomasuloEngine {
                 bestLB = lb;
             }
         }
-        if (bestLB != null) {
-            System.out.println("handleWriteBack: chose LOAD producer "
-                    + bestLB.getName()
-                    + " dest=" + bestLB.getDestReg()
-                    + " value=" + bestLB.getValue());
-        }
+
         if (bestInstr == null) {
             return; // should not happen, but safe guard
         }
@@ -336,10 +347,6 @@ public class TomasuloEngine {
             bestRS.clear();
         } else {
             // Load result: write loaded value to dest reg + broadcast
-        	 System.out.println("handleWriteBack: calling handleLoadWriteBack for "
-        	            + bestLB.getName()
-        	            + " dest=" + bestLB.getDestReg()
-        	            + " value=" + bestLB.getValue());
             handleLoadWriteBack(bestLB, bestInstr);
 
             bestInstr.setWriteBackCycle(currentCycle);
@@ -449,7 +456,8 @@ public class TomasuloEngine {
         long addr = lb.getAddress();
         InstructionType t = instr.getType();
         boolean isD = isDouble(t);
-        // use cache to update state and obtain the value (latency already accounted for)
+        // Use cache.loadNoLatency() to perform the actual load and update cache state
+        // Latency was already modeled during execution via cache.probeLatency()
         long result = cache.loadNoLatency(addr, isD);
 
         String dest = lb.getDestReg();
@@ -659,6 +667,9 @@ public class TomasuloEngine {
         }
 
         // ---------- LOADS ----------
+        // Cache-aware load timing: compute effective latency based on cache hit/miss
+        // effectiveLatency = loadLatencyBase + cache.probeLatency(address, isDouble, false)
+        // This ensures loads reflect actual cache behavior (hits = faster, misses = slower)
         for (LoadBufferEntry lb : loadBuffers) {
             if (!lb.isBusy()) continue;
             if (lb.isExecuting()) continue;
@@ -670,13 +681,15 @@ public class TomasuloEngine {
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = lb.getAddress();
-            int lat = loadLatencyBase; // lecture semantics: base only
+            
+            // Compute cache-aware latency: base + cache latency (hit or miss)
+            int cacheLatency = cache.probeLatency(addr, isD, false); // false = read operation
+            int lat = loadLatencyBase + cacheLatency;
+            
             int intendedEnd = currentCycle + lat - 1;
             if (reservedEnds.contains(intendedEnd)) {
                 continue; // postpone starting this load this cycle
             }
-            System.out.println("startReadyExecutions: starting LOAD exec on "
-                    + lb.getName() + " at cycle " + currentCycle + " addr=" + lb.getAddress());
             reservedEnds.add(intendedEnd);
             lb.setRemainingCycles(lat);
 
@@ -686,6 +699,10 @@ public class TomasuloEngine {
         }
 
         // ---------- STORES ----------
+        // Cache-aware store timing: compute effective latency based on cache hit/miss
+        // effectiveLatency = storeLatencyBase + cache.probeLatency(address, isDouble, true)
+        // Write-through + no-write-allocate policy: stores update memory regardless of cache state
+        // On miss, NO block fill occurs (as per write-through + no-allocate semantics)
         for (StoreBufferEntry sb : storeBuffers) {
             if (!sb.isBusy()) continue;
             if (sb.isExecuting()) continue;
@@ -696,7 +713,11 @@ public class TomasuloEngine {
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = sb.getAddress();
-            int lat = storeLatencyBase;
+            
+            // Compute cache-aware latency: base + cache latency (hit or miss)
+            int cacheLatency = cache.probeLatency(addr, isD, true); // true = write operation
+            int lat = storeLatencyBase + cacheLatency;
+            
             int intendedEnd = currentCycle + lat - 1;
             if (reservedEnds.contains(intendedEnd)) {
                 continue;
@@ -711,6 +732,14 @@ public class TomasuloEngine {
     }
 
     
+    /**
+     * Issue the next instruction from the program.
+     * 
+     * INSTRUCTION FETCH POLICY:
+     * Instructions are fetched directly from the Program object (instruction memory).
+     * NO cache simulation is performed for instruction fetches - they behave as "always hit".
+     * This ensures that ONLY data loads/stores incur cache hit/miss penalties.
+     */
     private void issueInstruction() {
         if (pc >= program.size()) return;
         if (fetchStalled) return;
@@ -786,16 +815,18 @@ public class TomasuloEngine {
         int rsIdx = instr.getRs();
         long imm = instr.getImmediate();
 
-        // source operand Rrs
+        // source operand Rrs - follow rule: never have both V and Q filled
         String owner = regStatus.getIntOwner(rsIdx);
         if (owner == null) {
             free.setQj(null);
             free.setVj(registers.getInt(rsIdx));
         } else {
             free.setQj(owner);
+            // Vj will be set later via broadcast when dependency resolves
         }
+        // Immediate goes in Vk (always ready)
         free.setQk(null);
-        free.setVk(0);
+        free.setVk(imm);
 
         free.setA(imm);
 
@@ -824,22 +855,24 @@ public class TomasuloEngine {
         int rtIdx = instr.getRt();
         long targetIndex = instr.getImmediate(); // we stored absolute PC index here in parser pass2
 
-        // source rs
+        // source rs - follow rule: never have both V and Q filled
         String ownerRs = regStatus.getIntOwner(rsIdx);
         if (ownerRs == null) {
             free.setQj(null);
             free.setVj(registers.getInt(rsIdx));
         } else {
             free.setQj(ownerRs);
+            // Vj will be set later via broadcast when dependency resolves
         }
 
-        // source rt
+        // source rt - follow rule: never have both V and Q filled
         String ownerRt = regStatus.getIntOwner(rtIdx);
         if (ownerRt == null) {
             free.setQk(null);
             free.setVk(registers.getInt(rtIdx));
         } else {
             free.setQk(ownerRt);
+            // Vk will be set later via broadcast when dependency resolves
         }
 
         free.setA(targetIndex); // branch target
@@ -895,10 +928,6 @@ public class TomasuloEngine {
             if (lb.isExecuting()) {
                 int before = lb.getRemainingCycles();
                 lb.setRemainingCycles(before - 1);
-                System.out.println("advanceExecuting: LOAD " + lb.getName()
-                        + " before=" + before
-                        + " after=" + lb.getRemainingCycles()
-                        + " cycle=" + currentCycle);
 
                 if (before == 1 && lb.getInstruction() != null) {
                     // For loads, execution completes in this cycle
@@ -972,11 +1001,6 @@ public class TomasuloEngine {
 
 
     private boolean issueLoad(Instruction instr) {
-    	System.out.println("issueLoad: pc=" + instr.getPcIndex()
-                + " raw='" + instr.getRawText() + "'"
-                + " memRegIsFp=" + instr.isMemRegFp()
-                + " rd=" + instr.getRd());
-
     	LoadBufferEntry free = null;
         for (LoadBufferEntry lb : loadBuffers) {
             if (!lb.isBusy()) {
@@ -1044,12 +1068,24 @@ public class TomasuloEngine {
         int rsIdx = instr.getRs();
         int rtIdx = instr.getRt();
 
-        // sources are FP regs
+        // sources are FP regs - follow rule: never have both V and Q filled
         String ownerJ = regStatus.getFpOwner(rsIdx);
-        if (ownerJ == null) { free.setQj(null); free.setVj(registers.getFp(rsIdx)); } else { free.setQj(ownerJ); }
+        if (ownerJ == null) { 
+            free.setQj(null); 
+            free.setVj(registers.getFp(rsIdx)); 
+        } else { 
+            free.setQj(ownerJ); 
+            // Vj will be set later via broadcast when dependency resolves
+        }
 
         String ownerK = regStatus.getFpOwner(rtIdx);
-        if (ownerK == null) { free.setQk(null); free.setVk(registers.getFp(rtIdx)); } else { free.setQk(ownerK); }
+        if (ownerK == null) { 
+            free.setQk(null); 
+            free.setVk(registers.getFp(rtIdx)); 
+        } else { 
+            free.setQk(ownerK); 
+            // Vk will be set later via broadcast when dependency resolves
+        }
 
         // dest
         String dest = "F" + rd;
