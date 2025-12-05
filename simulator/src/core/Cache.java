@@ -96,6 +96,101 @@ public class Cache {
         return new CacheAccessResult(value, latency);
     }
 
+    /**
+     * Probe expected latency for accessing this address without modifying cache state.
+     * If isWrite==true, this is for a store; otherwise a load.
+     */
+    public int probeLatency(long address, boolean isDouble, boolean isWrite) {
+        long blockNumber = address / blockSize;
+        int setIndex = (int) (blockNumber % numSets);
+        long tag = blockNumber / numSets;
+
+        CacheLine[] ways = sets[setIndex];
+        for (int w = 0; w < associativity; w++) {
+            CacheLine line = ways[w];
+            if (line.valid && line.tag == tag) {
+                return hitLatency;
+            }
+        }
+        return hitLatency + missPenalty;
+    }
+
+    /**
+     * Perform the actual load and update cache state; this does the block fill
+     * if necessary and updates hit/miss stats. Returns loaded value.
+     * This method does NOT account for latency (caller must have modeled it).
+     */
+    public long loadNoLatency(long address, boolean isDouble) {
+        long blockNumber = address / blockSize;
+        int setIndex = (int) (blockNumber % numSets);
+        long tag = blockNumber / numSets;
+
+        accessCounter++;
+
+        CacheLine[] ways = sets[setIndex];
+        for (int w = 0; w < associativity; w++) {
+            CacheLine line = ways[w];
+            if (line.valid && line.tag == tag) {
+                // hit
+                line.lruCounter = (int) accessCounter;
+                hits++;
+                return readValueFromLine(line, address, isDouble);
+            }
+        }
+
+        // miss: fetch block into victim
+        misses++;
+        int victim = -1;
+        int oldest = Integer.MAX_VALUE;
+        for (int w = 0; w < associativity; w++) {
+            CacheLine line = ways[w];
+            if (!line.valid) { victim = w; break; }
+            if (line.lruCounter < oldest) { oldest = line.lruCounter; victim = w; }
+        }
+        CacheLine chosen = ways[victim];
+        byte[] mem = memory.getRawDataCopy();
+        int blockStart = (int) (blockNumber * blockSize);
+        int toCopy = Math.min(blockSize, mem.length - blockStart);
+        if (chosen.blockData.length != blockSize) chosen.blockData = new byte[blockSize];
+        System.arraycopy(mem, blockStart, chosen.blockData, 0, toCopy);
+        chosen.valid = true;
+        chosen.tag = tag;
+        chosen.lruCounter = (int) accessCounter;
+
+        return readValueFromLine(chosen, address, isDouble);
+    }
+
+    /**
+     * Perform a store (write-through + no-write-allocate) and update cache state.
+     * This method performs the write immediately (no latency accounting here).
+     */
+    public void storeNoLatency(long address, long value, boolean isDouble) {
+        long blockNumber = address / blockSize;
+        int setIndex = (int) (blockNumber % numSets);
+        long tag = blockNumber / numSets;
+
+        accessCounter++;
+
+        CacheLine[] ways = sets[setIndex];
+        for (int w = 0; w < associativity; w++) {
+            CacheLine line = ways[w];
+            if (line.valid && line.tag == tag) {
+                // hit: update cache block and write through to memory
+                writeValueToLine(line, address, value, isDouble);
+                if (isDouble) memory.storeDouble(address, value);
+                else memory.storeWord(address, value);
+                line.lruCounter = (int) accessCounter;
+                hits++;
+                return;
+            }
+        }
+
+        // miss: no-write-allocate -> write only to memory
+        if (isDouble) memory.storeDouble(address, value);
+        else memory.storeWord(address, value);
+        misses++;
+    }
+
     // ---------- Store (write-through + no-write-allocate) ----------
 
     public CacheAccessResult store(long address, long value, boolean isDouble) {

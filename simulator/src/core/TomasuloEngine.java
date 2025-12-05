@@ -170,17 +170,13 @@ public class TomasuloEngine {
             if (instr == null) continue;
             if (instr.getWriteBackCycle() != -1) continue; // already committed
 
-            // Perform the actual memory write
+            // Perform the actual memory write via cache (write-through/no-allocate)
             InstructionType t = instr.getType();
             boolean isD = isDouble(t);
             long addr = sb.getAddress();
             long val = sb.getValue();
 
-            if (isD) {
-                memory.storeDouble(addr, val);
-            } else {
-                memory.storeWord(addr, val);
-            }
+            cache.storeNoLatency(addr, val, isD);
 
             // Mark WB cycle for timing table
             instr.setWriteBackCycle(currentCycle);
@@ -253,18 +249,19 @@ public class TomasuloEngine {
         LoadBufferEntry bestLB = null;
 
         int bestScore = -1;
-        int bestIssueCycle = Integer.MAX_VALUE;
+        int bestStartCycle = Integer.MAX_VALUE;
 
         // 3a) Check RS producers
         for (ReservationStation rs : rsCandidates) {
             String name = rs.getName();
             Instruction instr = rs.getInstruction();
             int score = countDependents(name);           // how many wait on this producer
-            int issue = instr.getIssueCycle();           // for FIFO tie-break
+            int start = instr.getStartExecCycle();       // tie-breaker: earliest start
+            if (start == -1) start = instr.getIssueCycle(); // fallback
 
-            if (score > bestScore || (score == bestScore && issue < bestIssueCycle)) {
+            if (score > bestScore || (score == bestScore && start < bestStartCycle)) {
                 bestScore = score;
-                bestIssueCycle = issue;
+                bestStartCycle = start;
                 bestName = name;
                 bestInstr = instr;
                 bestIsRS = true;
@@ -278,11 +275,12 @@ public class TomasuloEngine {
             String name = lb.getName();
             Instruction instr = lb.getInstruction();
             int score = countDependents(name);
-            int issue = instr.getIssueCycle();
+            int start = instr.getStartExecCycle();
+            if (start == -1) start = instr.getIssueCycle();
 
-            if (score > bestScore || (score == bestScore && issue < bestIssueCycle)) {
+            if (score > bestScore || (score == bestScore && start < bestStartCycle)) {
                 bestScore = score;
-                bestIssueCycle = issue;
+                bestStartCycle = start;
                 bestName = name;
                 bestInstr = instr;
                 bestIsRS = false;
@@ -432,7 +430,8 @@ public class TomasuloEngine {
         long addr = lb.getAddress();
         InstructionType t = instr.getType();
         boolean isD = isDouble(t);
-        long result = isD ? memory.loadDouble(addr) : memory.loadWord(addr);
+        // use cache to update state and obtain the value (latency already accounted for)
+        long result = cache.loadNoLatency(addr, isD);
 
         String dest = lb.getDestReg();
 
@@ -604,8 +603,13 @@ public class TomasuloEngine {
                     + lb.getName()
                     + " at cycle " + currentCycle
                     + " addr=" + lb.getAddress());
-            // For now: use fixed load latency (later we use cache)
-            lb.setRemainingCycles(loadLatencyBase);
+            // Determine cache latency and include it in remaining cycles
+            Instruction instr = lb.getInstruction();
+            InstructionType t = instr == null ? null : instr.getType();
+            boolean isD = isDouble(t);
+            long addr = lb.getAddress();
+            int cacheLat = cache.probeLatency(addr, isD, false);
+            lb.setRemainingCycles(loadLatencyBase + cacheLat);
 
             Instruction instr = lb.getInstruction();
             if (instr != null && instr.getStartExecCycle() == -1) {
@@ -629,7 +633,13 @@ public class TomasuloEngine {
             if (!sb.isAddressReady()) continue;
             if (!sb.isValueReady()) continue;
 
-            sb.setRemainingCycles(storeLatencyBase);
+            // include cache probe latency for stores
+            Instruction instr = sb.getInstruction();
+            InstructionType t = instr == null ? null : instr.getType();
+            boolean isD = isDouble(t);
+            long addr = sb.getAddress();
+            int cacheLat = cache.probeLatency(addr, isD, true);
+            sb.setRemainingCycles(storeLatencyBase + cacheLat);
 
             Instruction instr = sb.getInstruction();
             if (instr != null && instr.getStartExecCycle() == -1) {
@@ -1053,7 +1063,19 @@ public class TomasuloEngine {
 
             // If there is ANY older store still pending, don't let this load run yet
             if (storeInstr.getPcIndex() < loadPc) {
-                return false;
+                // If the older store's address is known, only block when addresses match.
+                // If the older store's address is not yet known, conservatively block.
+                if (!sb.isAddressReady()) {
+                    return false;
+                } else {
+                    long storeAddr = sb.getAddress();
+                    if (storeAddr == lb.getAddress()) {
+                        return false;
+                    } else {
+                        // different address, safe to continue
+                        continue;
+                    }
+                }
             }
         }
 
