@@ -1,0 +1,11 @@
+# Test Loop with BNE (Test Case 3 from requirements)
+# Initialize R1 = 24, R2 = 0
+# Loop should run 3 times (R1 = 24, 16, 8) then exit when R1 == R2
+
+DADDI R1, R0, 24       # R1 = 0 + 24 = 24
+DADDI R2, R0, 0        # R2 = 0 + 0 = 0
+LOOP: L.D F0, 8(R1)    # Load from 8 + R1
+MUL.D F4, F0, F2       # F4 = F0 * F2
+S.D F4, 8(R1)          # Store F4 to 8 + R1
+DSUBI R1, R1, 8        # R1 = R1 - 8
+BNE R1, R2, LOOP       # Branch to LOOP if R1 != R2

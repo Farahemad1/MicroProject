@@ -1,0 +1,10 @@
+# Test Cache Hit/Miss Penalties
+# First load to address 0 should MISS
+# Second load to address 8 (same block) should HIT
+# Third load to address 100 (different block) should MISS
+
+L.D F1, 0(R0)          # Load from addr 0 - should MISS
+L.D F2, 8(R0)          # Load from addr 8 - should HIT (same block as addr 0)
+L.D F3, 100(R0)        # Load from addr 100 - should MISS (different block)
+ADD.D F4, F1, F2       # Use loaded values
+MUL.D F5, F3, F4       # Use loaded value
