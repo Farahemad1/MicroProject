@@ -720,7 +720,13 @@ public class TomasuloEngine {
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = lb.getAddress();
-            int lat = loadLatencyBase; // lecture semantics: base only
+            
+            // Cache-aware timing: probe if this address will hit or miss
+            // On HIT: use base latency (cache provides data)
+            // On MISS: add miss penalty to base latency (need to fetch from memory)
+            int cachePenalty = cache.probeMissPenalty(addr, isD, false);
+            int lat = loadLatencyBase + cachePenalty;
+            
             int intendedEnd = currentCycle + lat - 1;
             if (reservedEnds.contains(intendedEnd)) {
                 continue; // postpone starting this load this cycle
@@ -744,7 +750,12 @@ public class TomasuloEngine {
             InstructionType t = instr == null ? null : instr.getType();
             boolean isD = isDouble(t);
             long addr = sb.getAddress();
-            int lat = storeLatencyBase;
+            
+            // Cache-aware timing: probe if this address will hit or miss
+            // Write-through + no-write-allocate: stores don't fetch on miss
+            int cachePenalty = cache.probeMissPenalty(addr, isD, true);
+            int lat = storeLatencyBase + cachePenalty;
+            
             int intendedEnd = currentCycle + lat - 1;
             if (reservedEnds.contains(intendedEnd)) {
                 continue;

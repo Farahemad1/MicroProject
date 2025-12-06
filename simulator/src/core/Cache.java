@@ -244,6 +244,35 @@ public class Cache {
     }
 
     /**
+     * Probe for cache access penalty (used by Tomasulo to add to base latency).
+     * On HIT: returns hitLatency
+     * On MISS: returns missPenalty (NOT hitLatency + missPenalty)
+     * 
+     * A cache access is EITHER a hit OR a miss, never both.
+     * 
+     * @param address Memory address to probe
+     * @param isDouble Whether this is a double (8 bytes) or word (4 bytes) access
+     * @param isWrite true for stores, false for loads
+     * @return hitLatency if hit, missPenalty if miss
+     */
+    public int probeMissPenalty(long address, boolean isDouble, boolean isWrite) {
+        long blockNumber = address / blockSize;
+        int setIndex = (int) (blockNumber % numSets);
+        long tag = blockNumber / numSets;
+
+        CacheLine[] ways = sets[setIndex];
+        for (int w = 0; w < associativity; w++) {
+            CacheLine line = ways[w];
+            if (line.valid && line.tag == tag) {
+                // CACHE HIT: return hit latency only
+                return hitLatency;
+            }
+        }
+        // CACHE MISS: return miss penalty only (not hit + miss)
+        return missPenalty;
+    }
+
+    /**
      * Perform the actual load and update cache state; this does the block fill
      * if necessary and updates hit/miss stats. Returns loaded value.
      * This method does NOT account for latency (caller must have modeled it).
